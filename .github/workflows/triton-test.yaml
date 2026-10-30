@@ -10,7 +10,7 @@ permissions:
 jobs:
   records:
     name: MI355X record readers
-    runs-on: [self-hosted, linux, x64, v41-records-c910e55-mi355x]
+    runs-on: v41-records-c910e55-mi355x
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
