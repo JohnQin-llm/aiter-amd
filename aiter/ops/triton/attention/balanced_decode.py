@@ -211,33 +211,28 @@ def balanced_gqa_decode(
 # ---------------------------------------------------------------------------------------------
 
 BALANCED_MIN_SEQS = 16
-BALANCED_MAX_SEQS = 128
+BALANCED_MAX_SEQS = 64
 BALANCED_MIN_MAX_SEQLEN = 2048
-BALANCED_MAX_WORK = 1 << 20  # num_seqs * max_seqlen_k
 
 
 def use_balanced_decode(num_seqs: int, num_kv_heads: int, page_size: int, max_seqlen_k: int) -> bool:
     """Pick balanced_gqa_decode over unified_attention from host-known values only (no
     device->host sync, so the choice is fixed per captured graph and valid for any lengths).
 
+    The rule does not use the actual lengths: under graph capture vLLM and SGLang pass a padded
+    max_seqlen_k (max_model_len / page-table width), so only a lower bound on it is used.
     Rule (MI355X, bf16, head size 128, GQA 4 and 8, page 16 and 1):
-      * 16 <= num_seqs <= 128: with fewer sequences unified_attention's per-sequence split
-        already fills the GPU and the balanced op's second (merge) launch dominates; with more,
-        unified_attention has enough programs to hide skew.
-      * max_seqlen_k >= 2048: below that every sequence is at most a few tiles, the batch is
-        latency-bound and unified_attention's single launch wins even when lengths differ.
-      * num_seqs * max_seqlen_k <= 2**20: above that bound unified_attention streams near the
-        bandwidth ceiling and the balanced kernel's loop is up to ~6 % slower.
-    Inside that range the balanced op is within a few percent of unified_attention on uniform
-    lengths and up to ~2x faster when lengths are skewed. num_kv_heads and page_size are part
-    of the signature for future tuning; the measured GQA ratios (4, 8) and page sizes (1, 16)
-    share the rule.
+      * 16 <= num_seqs <= 64: the range where skewed batches gain the most (1.6-9x) and the cost
+        on uniform long batches is smallest. Below 16 sequences unified_attention's own split
+        already fills the GPU; above 64 the balanced kernel's loop is 3-13 % slower on uniform
+        long batches.
+      * max_seqlen_k >= 2048 (always true for a padded bound): the caller may admit sequences
+        long enough for skew to matter.
+    Cost: on uniform batches inside the range the balanced op is up to ~5-11 us slower than
+    unified_attention at short lengths (L <= 2k: 1.04-1.76x) and 0.94-1.10x at L >= 8k; set
+    BALANCED_MAX_SEQS = 0 to disable. num_kv_heads and page_size are kept for future tuning.
     """
-    return (
-        BALANCED_MIN_SEQS <= num_seqs <= BALANCED_MAX_SEQS
-        and max_seqlen_k >= BALANCED_MIN_MAX_SEQLEN
-        and num_seqs * max_seqlen_k <= BALANCED_MAX_WORK
-    )
+    return BALANCED_MIN_SEQS <= num_seqs <= BALANCED_MAX_SEQS and max_seqlen_k >= BALANCED_MIN_MAX_SEQLEN
 
 
 def gqa_paged_decode(
@@ -254,7 +249,7 @@ def gqa_paged_decode(
 ) -> torch.Tensor:
     """Decode step (q_len 1) through balanced_gqa_decode or unified_attention, chosen by
     use_balanced_decode() on host values. max_seqlen_k is the host bound the caller already
-    passes to unified_attention (it may be an upper bound, e.g. under graph capture).
+    passes to unified_attention (a padded bound under graph capture is fine).
     cu_seqlens_q ([num_seqs + 1], arange) is the caller's query_start_loc; created here when
     None (one extra small kernel)."""
     num_seqs, num_q_heads, head_size = q.shape
