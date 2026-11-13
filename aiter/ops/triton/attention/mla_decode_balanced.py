@@ -14,12 +14,13 @@ Two main kernels share the schedule and the merge: a Gluon one for gfx950 with 1
 (async global->LDS copies, about 5 TB/s on long streams), and a portable Triton one (any head count
 that fits one MFMA tile, q_len >= 1).
 
-``mla_decode_fwd`` routes here (see ``use_mla_decode_balanced``) only when
-``AITER_MLA_DECODE_BALANCED=1``. On MI355X with 1-64 sequences it is 1.3-2x faster than the
-persistent asm path up to ~1M KV tokens and within ~1 % at 64 x 32k. With 2M+ tokens per step
-(e.g. 32-64 x 128k) the asm kernel streams faster (~5.8 against ~4.9 TB/s, 13-17 % slower), and
-the dispatch cannot see the KV lengths (frameworks pass padded bounds and whole-pool index buffers
-under graph capture), so it stays opt-in.
+``mla_decode_fwd`` routes gfx950 bf16 decode with 16 heads, q_len 1, page size 1 and 1-64 sequences
+here by default (``AITER_MLA_DECODE_BALANCED=0`` turns it off). With the persistent metadata the
+frameworks pass, it runs as a device-side hybrid: the balanced main kernel works when the step has
+at most ``BALANCED_MAX_TOKENS`` KV tokens and the persistent asm main kernel otherwise (it gets an
+empty work list in the first case), and one reduce launch serves both. The choice is made on the
+GPU from kv_indptr on every launch, so it needs no host sync and holds under HIP-graph replay.
+Without persistent metadata the balanced path alone runs only with ``AITER_MLA_DECODE_BALANCED=1``.
 """
 
 import os
@@ -66,7 +67,9 @@ def mla_decode_balanced(
     merge_block_p: int = 32,
     merge_block_d: int = 256,
     merge_num_warps: int = 4,
-) -> torch.Tensor:
+    hybrid: dict | None = None,
+    total_max: int = 0,
+):
     """
     q:          [num_seqs * q_len, H, 576] bf16 (512 NoPE + 64 RoPE), q_len = max_seqlen_q for every
                 sequence (uniform decode / MTP).
@@ -76,6 +79,13 @@ def mla_decode_balanced(
     kv_indptr:  [num_seqs + 1] int32, kv_indices: token slots. A sequence with no KV is skipped (its
                 output is left untouched, e.g. graph padding slots).
     Query token i of a sequence sees the first kv_len - q_len + i + 1 tokens (bottom-right causal).
+    hybrid:     the persistent asm metadata of the call (work_meta_data, work_indptr, work_info_set,
+                reduce_indptr). Then the kernels work only when the step has at most total_max KV
+                tokens (decided on the device). Returns the effective work_meta_data for the asm main
+                kernel that follows (empty work at or below total_max, the caller's above it) and a
+                function that, given the inputs of mla_reduce_v1 as a dict, launches the one reduce
+                kernel of the layer (the balanced merge at or below total_max, the reduce of the
+                asm partials above it). Without hybrid, returns o.
     """
     qlen = int(max_seqlen_q)
     total_q, nhead, dqk = q.shape
@@ -104,6 +114,18 @@ def mla_decode_balanced(
     task = torch.empty(num_seqs * 4, dtype=torch.int32, device=q.device)
     block_b = max(16, triton.next_power_of_2(num_seqs))
 
+    if hybrid is not None:
+        assert backend == "gluon", "the hybrid dispatch runs the Gluon kernel"
+        meta = hybrid["work_meta_data"]
+        eff_meta = torch.empty_like(meta)
+        zero_indptr = torch.empty_like(hybrid["work_indptr"])
+        assert meta.element_size() == 8 and meta.is_contiguous()
+        cap = num_progs * max(16, triton.next_power_of_2(num_seqs))
+        assert max(meta.numel(), zero_indptr.numel()) <= cap
+        hyb_args = (int(total_max), meta, eff_meta, meta.numel(), zero_indptr, zero_indptr.numel(),
+                    zero_indptr.data_ptr())
+    else:
+        hyb_args = (0, task, task, 0, task, 0, 0)
     if backend == "gluon":
         assert nhead == 16 and qlen == 1, "the Gluon kernel covers 16 heads, q_len 1"
         from aiter.ops.triton._gluon_kernels.gfx950.attention.mla_decode_balanced import (
@@ -114,8 +136,10 @@ def mla_decode_balanced(
             o, q, kv, kv_indptr, kv_indices, part_m, part_l, part_o, task,
             num_seqs, num_progs, float(sm_scale),
             q.stride(0), q.stride(1), o.stride(0), o.stride(1), kv.stride(0),
+            *hyb_args,
             DV=_DV, DR=_DR, UNIT=unit, TILE=g_tile, BLOCK_B=block_b, NUM_WARPS=g_warps,
-            NUM_BUFFERS=g_buffers, KV_PAD=8, num_warps=g_warps, waves_per_eu=g_waves,
+            NUM_BUFFERS=g_buffers, KV_PAD=8, HYBRID=hybrid is not None, num_warps=g_warps,
+            waves_per_eu=g_waves,
         )
     else:
         _mla_decode_balanced_kernel[(num_progs,)](
@@ -125,12 +149,28 @@ def mla_decode_balanced(
             NUM_HEADS=nhead, QLEN=qlen, DV=_DV, DR=_DR, TILE=unit, BLOCK_M=block_m, BLOCK_B=block_b,
             num_warps=num_warps, num_stages=num_stages,
         )
-    # one program per (sequence, query row, column block): fixed grid for a given batch size
-    _mla_decode_balanced_merge_kernel[(num_seqs, rows, _DV // merge_block_d)](
-        o, task, kv_indptr, part_m, part_l, part_o, num_progs, o.stride(0), o.stride(1),
-        NUM_HEADS=nhead, QLEN=qlen, DV=_DV,
-        BLOCK_P=merge_block_p, BLOCK_D=merge_block_d, num_warps=merge_num_warps,
-    )
+    def _merge(red=None):
+        # one program per (sequence or reduce tile, query row, column block): fixed grid
+        if red is None:
+            ra, n_tiles = (task, task, task, part_l, part_o), 0
+        else:
+            ra = (red["reduce_indptr"], red["reduce_final_map"], red["reduce_partial_map"],
+                  red["partial_lse"], red["partial_output"])
+            n_tiles = ra[0].numel() - 1
+            assert ra[3].dtype == torch.float32 and ra[4].dtype == torch.float32
+            assert ra[4].shape[-1] == _DV and ra[4].shape[-2] == nhead and ra[4].is_contiguous()
+        _mla_decode_balanced_merge_kernel[(max(num_seqs, n_tiles), rows, _DV // merge_block_d)](
+            o, task, kv_indptr, part_m, part_l, part_o, num_progs, o.stride(0), o.stride(1),
+            num_seqs, hyb_args[0], *ra, n_tiles,
+            NUM_HEADS=nhead, QLEN=qlen, DV=_DV,
+            BLOCK_P=merge_block_p, BLOCK_D=merge_block_d, HYBRID=hybrid is not None,
+            num_warps=merge_num_warps,
+        )
+
+    if hybrid is not None:
+        # the caller runs the asm main kernel with eff_meta, then this single reduce launch
+        return eff_meta, _merge
+    _merge()
     return o
 
 
@@ -138,6 +178,14 @@ def mla_decode_balanced(
 # Dispatch from mla_decode_fwd, on host-known values only (no device->host sync, graph-safe).
 # ---------------------------------------------------------------------------------------------
 
+# Hybrid crossover: at most this many KV tokens per step run the balanced kernels, more run the
+# persistent asm path (decided on the device per launch; see mla_decode_fwd).
+BALANCED_MAX_TOKENS = 1_572_864  # MI355X: the balanced path wins up to ~1.5-2M tokens per step
+
+
+def balanced_forced() -> bool:
+    """AITER_MLA_DECODE_BALANCED=1: also use the balanced path without persistent metadata."""
+    return os.environ.get("AITER_MLA_DECODE_BALANCED", "") == "1"
 BALANCED_MIN_SEQS = 1
 BALANCED_MAX_SEQS = 64  # above, the asm kernel is faster (256 x 8k: 1.07x, 256 x 32k: 1.20x)
 
@@ -151,12 +199,12 @@ def use_mla_decode_balanced(
     page_size: int,
     nhead_kv: int,
 ) -> bool:
-    """True when ``AITER_MLA_DECODE_BALANCED=1`` and the call is a bf16 gfx950 decode step this kernel
-    covers: 16 query heads, q_len 1 (the Triton kernel also handles q_len 2 / MTP, but is slower than
+    """True unless ``AITER_MLA_DECODE_BALANCED=0``, when the call is a bf16 gfx950 decode step this
+    kernel covers: 16 query heads, q_len 1 (the Triton kernel also handles q_len 2 / MTP, but is slower than
     the asm path there), 576-wide latent cache with page size 1, and
     BALANCED_MIN_SEQS..BALANCED_MAX_SEQS sequences. The caller checks the remaining mla_decode_fwd options
     (no LSE / logits output, no logit cap, no scales, no context parallelism, token-major layout)."""
-    if os.environ.get("AITER_MLA_DECODE_BALANCED", "0") != "1":
+    if os.environ.get("AITER_MLA_DECODE_BALANCED", "") == "0":
         return False
     from aiter.jit.utils.chip_info import get_gfx
 

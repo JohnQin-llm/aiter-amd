@@ -1069,10 +1069,17 @@ def mla_decode_fwd(
         kv_layout != "kv_shuffled" or q.ndim != 3 or q.shape[1] != 64
     ):
         raise ValueError("token CSR requires kv_shuffled QH64")
-    # Opt-in token-balanced Gluon/Triton decode for bf16 16-head MLA (AITER_MLA_DECODE_BALANCED=1); it
-    # ignores the persistent metadata buffers and computes its own split on the device.
+    # BEGIN mla_decode_balanced dispatch
+    # Token-balanced Gluon/Triton decode for bf16 16-head MLA (aiter.ops.triton.attention.
+    # mla_decode_balanced; on by default in its scope, AITER_MLA_DECODE_BALANCED=0 turns it off). With
+    # persistent metadata it runs as a device-side hybrid: its main kernel works when the step has
+    # at most BALANCED_MAX_TOKENS KV tokens, the asm main kernel below gets empty work then and does
+    # the work otherwise, and one reduce launch serves both (no host sync; graph replay keeps it).
+    _bal_reduce = None
     if (
-        os.environ.get("AITER_MLA_DECODE_BALANCED", "0") == "1"
+        q.dtype == dtypes.bf16
+        and q.dim() == 3
+        and q.shape[1] == 16
         and kv_layout == "token_major"
         and kv_csr_layout == "page"
         and logit_cap <= 0
@@ -1084,24 +1091,46 @@ def mla_decode_fwd(
         and cp_world_size == 1
         and causal
     ):
-        from aiter.ops.triton.attention.mla_decode_balanced import (
-            mla_decode_balanced,
-            use_mla_decode_balanced,
-        )
+        from aiter.ops.triton.attention import mla_decode_balanced as _bal
 
-        if use_mla_decode_balanced(
+        if _bal.use_mla_decode_balanced(
             q, kv_buffer, o, qo_indptr, max_seqlen_q, page_size, nhead_kv
         ):
-            mla_decode_balanced(
-                q,
-                kv_buffer,
-                o,
-                kv_indptr,
-                kv_indices,
-                max_seqlen_q,
-                q.shape[-1] ** -0.5 if sm_scale is None else sm_scale,
+            _scale = q.shape[-1] ** -0.5 if sm_scale is None else sm_scale
+            _hybrid = (
+                work_meta_data is not None
+                and work_indptr is not None
+                and work_info_set is not None
+                and reduce_indptr is not None
+                and reduce_final_map is not None
+                and reduce_partial_map is not None
+                and (
+                    num_kv_splits is not None
+                    or _use_persistent_mla_decode(
+                        qo_indptr.shape[0] - 1, q.shape[1], max_seqlen_q, q.dtype,
+                        kv_buffer.dtype,
+                    )
+                )
             )
-            return o, None
+            if not _hybrid:
+                if _bal.balanced_forced():
+                    _bal.mla_decode_balanced(
+                        q, kv_buffer, o, kv_indptr, kv_indices, max_seqlen_q, _scale
+                    )
+                    return o, None
+            else:
+                work_meta_data, _bal_reduce = _bal.mla_decode_balanced(
+                    q,
+                    kv_buffer,
+                    o,
+                    kv_indptr,
+                    kv_indices,
+                    max_seqlen_q,
+                    _scale,
+                    hybrid=dict(work_meta_data=work_meta_data, work_indptr=work_indptr),
+                    total_max=_bal.BALANCED_MAX_TOKENS,
+                )
+    # END mla_decode_balanced dispatch
 
     kv_shuffled_flag = 0
     # ATOM's QH128 dense path must route before accessing any CSR metadata.
@@ -1710,17 +1739,29 @@ def mla_decode_fwd(
                 causal,
             )
 
-        _mla_decode_reduce_v1_dispatch(
-            logits,
-            attn_lse,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            max_seqlen_q,
-            num_kv_splits,
-            o,
-            final_lse,
-        )
+        if _bal_reduce is not None:
+            # hybrid balanced dispatch: one reduce launch (balanced merge or asm partials)
+            _bal_reduce(
+                dict(
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    partial_lse=attn_lse,
+                    partial_output=logits.view(-1, nhead, v_head_dim),
+                )
+            )
+        else:
+            _mla_decode_reduce_v1_dispatch(
+                logits,
+                attn_lse,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                max_seqlen_q,
+                num_kv_splits,
+                o,
+                final_lse,
+            )
 
     if io_transformed:
         if return_logits:

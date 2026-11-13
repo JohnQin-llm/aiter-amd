@@ -192,11 +192,20 @@ def _mla_decode_balanced_merge_kernel(
     num_progs,
     stride_o_t,
     stride_o_h,
+    num_seqs,
+    total_max,  # > 0: hybrid dispatch threshold on the step's KV tokens
+    red_indptr_ptr,  # hybrid, asm regime: the inputs of mla_reduce_v1 (reduce_indptr [n_tiles + 1],
+    red_final_ptr,  # reduce_final_map [n_tiles, 2], reduce_partial_map, partial lse [P, H]
+    red_pmap_ptr,  # (natural log) and partial output [P, H, DV], both fp32)
+    red_lse_ptr,
+    red_out_ptr,
+    n_tiles,
     NUM_HEADS: tl.constexpr,
     QLEN: tl.constexpr,
     DV: tl.constexpr,
     BLOCK_P: tl.constexpr,  # partials merged per step
     BLOCK_D: tl.constexpr,  # output columns per program
+    HYBRID: tl.constexpr,
 ):
     """Merge the partials of split sequences by log-sum-exp.
 
@@ -205,6 +214,50 @@ def _mla_decode_balanced_merge_kernel(
     and last program covering it and the partial slot of the first piece. Sequences without KV
     (e.g. graph padding) are skipped."""
     seq = tl.program_id(0)
+    if HYBRID:
+        # Above total_max KV tokens the balanced main kernel did nothing and the asm main kernel did
+        # the work: this launch then does the job of mla_reduce_v1 on the asm partials (one reduce
+        # launch per layer in both regimes). Tile t merges the partials
+        # reduce_partial_map[reduce_indptr[t]:reduce_indptr[t + 1]] into output row
+        # reduce_final_map[t][0] with weights exp(lse_k - lse), as mla_reduce_v1 does.
+        # the reduce-tile scalars are read together with the regime test (one round trip)
+        t = seq
+        tv = t < n_tiles
+        r_last = tl.load(red_indptr_ptr + n_tiles)
+        r_s = tl.load(red_indptr_ptr + t, mask=tv, other=0)
+        r_e = tl.load(red_indptr_ptr + t + 1, mask=tv, other=0)
+        q0 = tl.load(red_final_ptr + 2 * t, mask=tv, other=0).to(tl.int64)
+        tok_total = tl.load(kv_indptr_ptr + num_seqs) - tl.load(kv_indptr_ptr)
+        small = tok_total <= total_max
+        if not small:
+            if tv:
+                if (r_s != r_last) & (r_e > r_s):
+                    h = tl.program_id(1)
+                    offs_rp = tl.arange(0, BLOCK_P)
+                    offs_rd = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
+                    rm = tl.max(tl.full([BLOCK_P], float("-inf"), dtype=tl.float32), axis=0)
+                    rl = tl.sum(tl.zeros([BLOCK_P], dtype=tl.float32), axis=0)
+                    ro = tl.zeros([BLOCK_D], dtype=tl.float32)
+                    for p0 in range(r_s, r_e, BLOCK_P):
+                        pp = p0 + offs_rp
+                        pmk = pp < r_e
+                        prow = tl.load(red_pmap_ptr + pp, mask=pmk, other=0).to(tl.int64)
+                        lse = tl.load(red_lse_ptr + prow * NUM_HEADS + h, mask=pmk, other=float("-inf"))
+                        ov = tl.load(red_out_ptr + (prow * NUM_HEADS + h)[:, None] * DV + offs_rd[None, :],
+                                     mask=pmk[:, None], other=0.0)
+                        mn = tl.maximum(rm, tl.max(lse, axis=0))
+                        ms = tl.where(mn == float("-inf"), 0.0, mn)
+                        a = tl.exp(rm - ms)
+                        w = tl.exp(lse - ms)
+                        rl = rl * a + tl.sum(w, axis=0)
+                        ro = ro * a + tl.sum(ov * w[:, None], axis=0)
+                        rm = mn
+                    res = ro / tl.where(rl == 0.0, 1.0, rl)
+                    tl.store(out_ptr + q0 * stride_o_t + h * stride_o_h + offs_rd,
+                             res.to(out_ptr.dtype.element_ty))
+            return
+        if seq >= num_seqs:
+            return
     kv_lo = tl.load(kv_indptr_ptr + seq)
     kv_hi = tl.load(kv_indptr_ptr + seq + 1)
     p_first = tl.load(task_ptr + seq * 4)

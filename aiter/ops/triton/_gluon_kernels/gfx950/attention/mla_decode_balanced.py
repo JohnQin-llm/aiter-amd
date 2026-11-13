@@ -74,6 +74,13 @@ def _mla_decode_balanced_gluon_kernel(
     stride_o_t,
     stride_o_h,
     stride_kv,
+    total_max,  # > 0: no program does any work when the step has more KV tokens (hybrid dispatch)
+    meta_src_ptr,  # hybrid: persistent asm metadata pointer table (int64) ...
+    meta_dst_ptr,  # ... and its effective copy for this launch
+    n_meta,
+    zero_indptr_ptr,  # an all-zero work_indptr (no asm work on any CU) ...
+    n_zero,
+    zero_addr,  # ... and its address, as an int64
     DV: gl.constexpr,
     DR: gl.constexpr,
     UNIT: gl.constexpr,  # schedule granularity (tokens)
@@ -82,6 +89,7 @@ def _mla_decode_balanced_gluon_kernel(
     NUM_WARPS: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
     KV_PAD: gl.constexpr,
+    HYBRID: gl.constexpr,
 ):
     BLOCK_M: gl.constexpr = 16  # 16 query heads, one MFMA row block
     sched_l: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
@@ -112,6 +120,19 @@ def _mla_decode_balanced_gluon_kernel(
     cum = gl.associative_scan(units, 0, _add)
     total = gl.sum(units, axis=0).to(gl.int64)
     nprog = gl.minimum(total, num_progs)
+    tok_total = gl.sum(lens, axis=0)
+    nprog = gl.where((total_max > 0) & (tok_total > total_max), 0, nprog)
+    if HYBRID:
+        # Device-side choice between these kernels and the persistent asm launches that follow,
+        # from the step's KV token count (graph-safe, no host sync). At or below total_max the asm
+        # main kernel gets an all-zero work_indptr through its pointer table and exits at once;
+        # above it the metadata passes through. The reduce is one combined launch (merge kernel).
+        # one BLOCK_B chunk of each array per program (the launcher checks they fit the grid)
+        h_small = tok_total <= total_max
+        h_c = pid * BLOCK_B + offs_b
+        h_v = gl.load(meta_src_ptr + h_c, mask=h_c < n_meta, other=0)
+        gl.store(meta_dst_ptr + h_c, gl.where((h_c == 0) & h_small, zero_addr, h_v), mask=h_c < n_meta)
+        gl.store(zero_indptr_ptr + h_c, gl.zeros([BLOCK_B], gl.int32, layout=sched_l), mask=h_c < n_zero)
     if pid < nprog:
         u0 = (pid * total) // nprog
         u1 = ((pid + 1) * total) // nprog
