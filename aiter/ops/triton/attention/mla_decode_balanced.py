@@ -150,7 +150,7 @@ def mla_decode_balanced(
             num_warps=num_warps, num_stages=num_stages,
         )
     def _merge(red=None):
-        # one program per (sequence or reduce tile, query row, column block): fixed grid
+        # one program per (sequence, query row, column block): fixed grid
         if red is None:
             ra, n_tiles = (task, task, task, part_l, part_o), 0
         else:
@@ -159,7 +159,7 @@ def mla_decode_balanced(
             n_tiles = ra[0].numel() - 1
             assert ra[3].dtype == torch.float32 and ra[4].dtype == torch.float32
             assert ra[4].shape[-1] == _DV and ra[4].shape[-2] == nhead and ra[4].is_contiguous()
-        _mla_decode_balanced_merge_kernel[(max(num_seqs, n_tiles), rows, _DV // merge_block_d)](
+        _mla_decode_balanced_merge_kernel[(num_seqs, rows, _DV // merge_block_d)](
             o, task, kv_indptr, part_m, part_l, part_o, num_progs, o.stride(0), o.stride(1),
             num_seqs, hyb_args[0], *ra, n_tiles,
             NUM_HEADS=nhead, QLEN=qlen, DV=_DV,

@@ -1112,8 +1112,11 @@ def mla_decode_fwd(
                     )
                 )
             )
-            if not _hybrid:
-                if _bal.balanced_forced():
+            # kv_indices bounds the step's KV tokens on the host (fixed under graph capture):
+            # if even that bound is within the balanced regime, the asm path can never be needed
+            _host_small = kv_indices.numel() <= _bal.BALANCED_MAX_TOKENS
+            if _host_small or not _hybrid:
+                if _host_small or _bal.balanced_forced():
                     _bal.mla_decode_balanced(
                         q, kv_buffer, o, kv_indptr, kv_indices, max_seqlen_q, _scale
                     )

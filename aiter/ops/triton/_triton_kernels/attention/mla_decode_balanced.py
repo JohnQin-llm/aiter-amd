@@ -214,6 +214,13 @@ def _mla_decode_balanced_merge_kernel(
     and last program covering it and the partial slot of the first piece. Sequences without KV
     (e.g. graph padding) are skipped."""
     seq = tl.program_id(0)
+    # every scalar this program may need is read up front, in one round trip
+    sv = seq < num_seqs
+    kv_lo = tl.load(kv_indptr_ptr + seq, mask=sv, other=0)
+    kv_hi = tl.load(kv_indptr_ptr + seq + 1, mask=sv, other=0)
+    p_first = tl.load(task_ptr + seq * 4, mask=sv, other=-1)
+    p_last = tl.load(task_ptr + seq * 4 + 1, mask=sv, other=0)
+    first_slot = tl.load(task_ptr + seq * 4 + 2, mask=sv, other=0)
     if HYBRID:
         # Above total_max KV tokens the balanced main kernel did nothing and the asm main kernel did
         # the work: this launch then does the job of mla_reduce_v1 on the asm partials (one reduce
@@ -230,11 +237,14 @@ def _mla_decode_balanced_merge_kernel(
         tok_total = tl.load(kv_indptr_ptr + num_seqs) - tl.load(kv_indptr_ptr)
         small = tok_total <= total_max
         if not small:
-            if tv:
-                if (r_s != r_last) & (r_e > r_s):
-                    h = tl.program_id(1)
-                    offs_rp = tl.arange(0, BLOCK_P)
-                    offs_rd = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
+            # the grid stays (num_seqs, rows, column blocks); program seq walks the reduce tiles
+            # seq, seq + num_seqs, ... until the used ones end (tile start == reduce_indptr[-1])
+            h = tl.program_id(1)
+            offs_rp = tl.arange(0, BLOCK_P)
+            offs_rd = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
+            go = tv & (r_s != r_last)
+            while go:
+                if r_e > r_s:
                     rm = tl.max(tl.full([BLOCK_P], float("-inf"), dtype=tl.float32), axis=0)
                     rl = tl.sum(tl.zeros([BLOCK_P], dtype=tl.float32), axis=0)
                     ro = tl.zeros([BLOCK_D], dtype=tl.float32)
@@ -255,16 +265,17 @@ def _mla_decode_balanced_merge_kernel(
                     res = ro / tl.where(rl == 0.0, 1.0, rl)
                     tl.store(out_ptr + q0 * stride_o_t + h * stride_o_h + offs_rd,
                              res.to(out_ptr.dtype.element_ty))
+                t += num_seqs
+                tv = t < n_tiles
+                r_s = tl.load(red_indptr_ptr + t, mask=tv, other=0)
+                r_e = tl.load(red_indptr_ptr + t + 1, mask=tv, other=0)
+                q0 = tl.load(red_final_ptr + 2 * t, mask=tv, other=0).to(tl.int64)
+                go = tv & (r_s != r_last)
             return
         if seq >= num_seqs:
             return
-    kv_lo = tl.load(kv_indptr_ptr + seq)
-    kv_hi = tl.load(kv_indptr_ptr + seq + 1)
-    p_first = tl.load(task_ptr + seq * 4)
     if (kv_hi <= kv_lo) | (p_first < 0):
         return
-    p_last = tl.load(task_ptr + seq * 4 + 1)
-    first_slot = tl.load(task_ptr + seq * 4 + 2)
     row = tl.program_id(1)
 
     # BLOCK_P partials per step, so even the longest sequence of a skewed batch (split over many
