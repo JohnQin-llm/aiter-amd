@@ -75,6 +75,7 @@ def _mla_decode_balanced_gluon_kernel(
     stride_o_h,
     stride_kv,
     total_max,  # > 0: no program does any work when the step has more KV tokens (hybrid dispatch)
+    total_min,  # > 0: no program does any work when the step has at most this many KV tokens
     meta_src_ptr,  # hybrid: persistent asm metadata pointer table (int64) ...
     meta_dst_ptr,  # ... and its effective copy for this launch
     n_meta,
@@ -98,6 +99,10 @@ def _mla_decode_balanced_gluon_kernel(
     )
     q_dl: gl.constexpr = gl.DotOperandLayout(0, mma_l, 8)
     k_dl: gl.constexpr = gl.DotOperandLayout(1, mma_l, 8)
+    # PV contracts over the TILE keys: 8 bf16 per lane needs K >= 32, a 16-key tile takes 4
+    KW_PV: gl.constexpr = 8 if TILE >= 32 else 4
+    p_dl: gl.constexpr = gl.DotOperandLayout(0, mma_l, KW_PV)
+    v_dl: gl.constexpr = gl.DotOperandLayout(1, mma_l, KW_PV)
     q_bl: gl.constexpr = gl.BlockedLayout([1, 8], [8, 8], [1, NUM_WARPS], [1, 0])
     # async copies: 16 B per lane, a 1 KB NoPE row per warp instruction / 8 RoPE rows
     cp_l: gl.constexpr = gl.BlockedLayout([1, 8], [1, 64], [NUM_WARPS, 1], [1, 0])
@@ -122,6 +127,7 @@ def _mla_decode_balanced_gluon_kernel(
     nprog = gl.minimum(total, num_progs)
     tok_total = gl.sum(lens, axis=0)
     nprog = gl.where((total_max > 0) & (tok_total > total_max), 0, nprog)
+    nprog = gl.where((total_min > 0) & (tok_total <= total_min), 0, nprog)
     if HYBRID:
         # Device-side choice between these kernels and the persistent asm launches that follow,
         # from the step's KV token count (graph-safe, no host sync). At or below total_max the asm
@@ -210,8 +216,8 @@ def _mla_decode_balanced_gluon_kernel(
                 p = gl.exp2(s * qk_scale - m_new[:, None])
                 alpha = gl.exp2(m_i - m_new)
                 l_i = l_i * alpha + gl.sum(p, axis=1)
-                v = gl.amd.cdna4.async_copy.load_shared_relaxed(kv_t, k_dl)
-                p_dot = gl.convert_layout(p.to(gl.bfloat16), q_dl)
+                v = gl.amd.cdna4.async_copy.load_shared_relaxed(kv_t, v_dl)
+                p_dot = gl.convert_layout(p.to(gl.bfloat16), p_dl)
                 acc = acc * alpha[:, None]
                 acc = gl.amd.cdna4.mfma(p_dot, v, acc)
                 m_i = m_new

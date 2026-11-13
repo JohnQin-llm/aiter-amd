@@ -200,12 +200,14 @@ def _mla_decode_balanced_merge_kernel(
     red_lse_ptr,
     red_out_ptr,
     n_tiles,
+    num_progs_long,  # DUAL: programs of the long-step kernel (its partial layout)
     NUM_HEADS: tl.constexpr,
     QLEN: tl.constexpr,
     DV: tl.constexpr,
     BLOCK_P: tl.constexpr,  # partials merged per step
     BLOCK_D: tl.constexpr,  # output columns per program
     HYBRID: tl.constexpr,
+    DUAL: tl.constexpr = False,
 ):
     """Merge the partials of split sequences by log-sum-exp.
 
@@ -274,6 +276,11 @@ def _mla_decode_balanced_merge_kernel(
             return
         if seq >= num_seqs:
             return
+    if DUAL:
+        # two main kernels, chosen on the device by the step's KV tokens: read the partial layout
+        # (program count) of the one that ran
+        tok_all = tl.load(kv_indptr_ptr + num_seqs) - tl.load(kv_indptr_ptr)
+        num_progs = tl.where(tok_all <= total_max, num_progs, num_progs_long)
     if (kv_hi <= kv_lo) | (p_first < 0):
         return
     row = tl.program_id(1)

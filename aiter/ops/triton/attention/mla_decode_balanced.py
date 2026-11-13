@@ -69,6 +69,7 @@ def mla_decode_balanced(
     merge_num_warps: int = 4,
     hybrid: dict | None = None,
     total_max: int = 0,
+    dual: bool = False,
 ):
     """
     q:          [num_seqs * q_len, H, 576] bf16 (512 NoPE + 64 RoPE), q_len = max_seqlen_q for every
@@ -86,6 +87,9 @@ def mla_decode_balanced(
                 function that, given the inputs of mla_reduce_v1 as a dict, launches the one reduce
                 kernel of the layer (the balanced merge at or below total_max, the reduce of the
                 asm partials above it). Without hybrid, returns o.
+    dual:       (Gluon) also launch the long-step configuration (LONG_CONFIG): steps with at most
+                total_max KV tokens run the configured kernel, longer steps the long-step kernel; the
+                choice is made on the device, graph-safe. Returns o.
     """
     qlen = int(max_seqlen_q)
     total_q, nhead, dqk = q.shape
@@ -107,7 +111,11 @@ def mla_decode_balanced(
         # the Gluon kernel holds 2 x 64-token LDS tiles (150 KB): one program per CU
         programs_per_cu = 1 if backend == "gluon" else 2
     num_progs = max(1, int(_num_cus(q.device) * programs_per_cu))
-    n = num_progs * 2 * block_m
+    num_progs_long = 0
+    if dual:
+        assert backend == "gluon" and hybrid is None and total_max > 0
+        num_progs_long = max(1, int(_num_cus(q.device) * LONG_CONFIG["programs_per_cu"]))
+    n = max(num_progs, num_progs_long) * 2 * block_m
     part_m = torch.empty(n, dtype=torch.float32, device=q.device)
     part_l = torch.empty(n, dtype=torch.float32, device=q.device)
     part_o = torch.empty(n * _DV, dtype=torch.float32, device=q.device)
@@ -132,15 +140,26 @@ def mla_decode_balanced(
             _mla_decode_balanced_gluon_kernel,
         )
 
-        _mla_decode_balanced_gluon_kernel[(num_progs,)](
-            o, q, kv, kv_indptr, kv_indices, part_m, part_l, part_o, task,
-            num_seqs, num_progs, float(sm_scale),
-            q.stride(0), q.stride(1), o.stride(0), o.stride(1), kv.stride(0),
-            *hyb_args,
-            DV=_DV, DR=_DR, UNIT=unit, TILE=g_tile, BLOCK_B=block_b, NUM_WARPS=g_warps,
-            NUM_BUFFERS=g_buffers, KV_PAD=8, HYBRID=hybrid is not None, num_warps=g_warps,
-            waves_per_eu=g_waves,
-        )
+        def _main(nprogs, t_max, t_min, unit_, tile_, warps_, buffers_, hyb, flag):
+            _mla_decode_balanced_gluon_kernel[(nprogs,)](
+                o, q, kv, kv_indptr, kv_indices, part_m, part_l, part_o, task,
+                num_seqs, nprogs, float(sm_scale),
+                q.stride(0), q.stride(1), o.stride(0), o.stride(1), kv.stride(0),
+                t_max, t_min, *hyb[1:],
+                DV=_DV, DR=_DR, UNIT=unit_, TILE=tile_, BLOCK_B=block_b, NUM_WARPS=warps_,
+                NUM_BUFFERS=buffers_, KV_PAD=8, HYBRID=flag, num_warps=warps_,
+                waves_per_eu=g_waves,
+            )
+
+        if dual:
+            # at most total_max tokens: this configuration; more: the long-step configuration
+            _main(num_progs, int(total_max), 0, unit, g_tile, g_warps, g_buffers, hyb_args, False)
+            lc = LONG_CONFIG
+            _main(num_progs_long, 0, int(total_max), lc["unit"], lc["tile"], lc["warps"],
+                  lc["buffers"], hyb_args, False)
+        else:
+            _main(num_progs, hyb_args[0], 0, unit, g_tile, g_warps, g_buffers, hyb_args,
+                  hybrid is not None)
     else:
         _mla_decode_balanced_kernel[(num_progs,)](
             o, q, kv, kv_indptr, kv_indices, part_m, part_l, part_o, task,
@@ -161,9 +180,9 @@ def mla_decode_balanced(
             assert ra[4].shape[-1] == _DV and ra[4].shape[-2] == nhead and ra[4].is_contiguous()
         _mla_decode_balanced_merge_kernel[(num_seqs, rows, _DV // merge_block_d)](
             o, task, kv_indptr, part_m, part_l, part_o, num_progs, o.stride(0), o.stride(1),
-            num_seqs, hyb_args[0], *ra, n_tiles,
+            num_seqs, int(total_max) if dual else hyb_args[0], *ra, n_tiles, num_progs_long,
             NUM_HEADS=nhead, QLEN=qlen, DV=_DV,
-            BLOCK_P=merge_block_p, BLOCK_D=merge_block_d, HYBRID=hybrid is not None,
+            BLOCK_P=merge_block_p, BLOCK_D=merge_block_d, HYBRID=hybrid is not None, DUAL=dual,
             num_warps=merge_num_warps,
         )
 
@@ -181,6 +200,17 @@ def mla_decode_balanced(
 # Hybrid crossover: at most this many KV tokens per step run the balanced kernels, more run the
 # persistent asm path (decided on the device per launch; see mla_decode_fwd).
 BALANCED_MAX_TOKENS = 1_572_864  # MI355X: the balanced path wins up to ~1.5-2M tokens per step
+
+# Long-step Gluon configuration: 1-warp programs with 16-token tiles, 4 per CU. Each wave streams its
+# own tiles independently (no cross-warp softmax exchange or barrier), 6.4 TB/s at 64 x 128k.
+LONG_CONFIG = dict(programs_per_cu=4, unit=64, tile=16, warps=1, buffers=2)
+# Below this many KV tokens per step the 4-warp configuration is faster (fewer split pieces to merge)
+DUAL_SWITCH_TOKENS = int(os.environ.get("AITER_MLA_BALANCED_SWITCH_TOKENS", 163_840))
+
+
+def long_steps_on_asm() -> bool:
+    """AITER_MLA_BALANCED_LONG=asm: run long steps on the persistent asm kernel (device hybrid)."""
+    return os.environ.get("AITER_MLA_BALANCED_LONG", "") == "asm"
 
 
 def balanced_forced() -> bool:

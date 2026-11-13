@@ -1070,11 +1070,11 @@ def mla_decode_fwd(
     ):
         raise ValueError("token CSR requires kv_shuffled QH64")
     # BEGIN mla_decode_balanced dispatch
-    # Token-balanced Gluon/Triton decode for bf16 16-head MLA (aiter.ops.triton.attention.
-    # mla_decode_balanced; on by default in its scope, AITER_MLA_DECODE_BALANCED=0 turns it off). With
-    # persistent metadata it runs as a device-side hybrid: its main kernel works when the step has
-    # at most BALANCED_MAX_TOKENS KV tokens, the asm main kernel below gets empty work then and does
-    # the work otherwise, and one reduce launch serves both (no host sync; graph replay keeps it).
+    # Token-balanced Gluon decode for bf16 16-head MLA (aiter.ops.triton.attention.
+    # mla_decode_balanced; on by default in its scope, AITER_MLA_DECODE_BALANCED=0 turns it off).
+    # Short and long steps run two Gluon configurations chosen on the device by the step's KV tokens
+    # (no host sync, graph-safe). AITER_MLA_BALANCED_LONG=asm keeps long steps on the persistent asm
+    # kernel instead (its main kernel then gets empty work for short steps; one reduce launch).
     _bal_reduce = None
     if (
         q.dtype == dtypes.bf16
@@ -1112,27 +1112,33 @@ def mla_decode_fwd(
                     )
                 )
             )
-            # kv_indices bounds the step's KV tokens on the host (fixed under graph capture):
-            # if even that bound is within the balanced regime, the asm path can never be needed
-            _host_small = kv_indices.numel() <= _bal.BALANCED_MAX_TOKENS
-            if _host_small or not _hybrid:
-                if _host_small or _bal.balanced_forced():
-                    _bal.mla_decode_balanced(
-                        q, kv_buffer, o, kv_indptr, kv_indices, max_seqlen_q, _scale
-                    )
-                    return o, None
-            else:
-                work_meta_data, _bal_reduce = _bal.mla_decode_balanced(
-                    q,
-                    kv_buffer,
-                    o,
-                    kv_indptr,
-                    kv_indices,
-                    max_seqlen_q,
-                    _scale,
-                    hybrid=dict(work_meta_data=work_meta_data, work_indptr=work_indptr),
-                    total_max=_bal.BALANCED_MAX_TOKENS,
+            _switch = _bal.DUAL_SWITCH_TOKENS
+            if kv_indices.numel() <= _switch:
+                # kv_indices bounds the step's KV tokens on the host (fixed under graph capture):
+                # only the short-step kernel can be needed
+                _bal.mla_decode_balanced(
+                    q, kv_buffer, o, kv_indptr, kv_indices, max_seqlen_q, _scale
                 )
+                return o, None
+            if not (_bal.long_steps_on_asm() and _hybrid):
+                # both Gluon configurations, chosen on the device by the step's KV tokens
+                _bal.mla_decode_balanced(
+                    q, kv_buffer, o, kv_indptr, kv_indices, max_seqlen_q, _scale,
+                    dual=True, total_max=_switch,
+                )
+                return o, None
+            # AITER_MLA_BALANCED_LONG=asm: long steps on the persistent asm path (device-side hybrid)
+            work_meta_data, _bal_reduce = _bal.mla_decode_balanced(
+                q,
+                kv_buffer,
+                o,
+                kv_indptr,
+                kv_indices,
+                max_seqlen_q,
+                _scale,
+                hybrid=dict(work_meta_data=work_meta_data, work_indptr=work_indptr),
+                total_max=_bal.BALANCED_MAX_TOKENS,
+            )
     # END mla_decode_balanced dispatch
 
     kv_shuffled_flag = 0
