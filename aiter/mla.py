@@ -1069,6 +1069,40 @@ def mla_decode_fwd(
         kv_layout != "kv_shuffled" or q.ndim != 3 or q.shape[1] != 64
     ):
         raise ValueError("token CSR requires kv_shuffled QH64")
+    # Opt-in token-balanced Triton decode for bf16 16-head MLA (AITER_MLA_DECODE_BALANCED=1); it
+    # ignores the persistent metadata buffers and computes its own split on the device.
+    if (
+        os.environ.get("AITER_MLA_DECODE_BALANCED", "0") == "1"
+        and kv_layout == "token_major"
+        and kv_csr_layout == "page"
+        and logit_cap <= 0
+        and not return_lse
+        and not return_logits
+        and q_scale is None
+        and kv_scale is None
+        and g_kv_indptr is None
+        and cp_world_size == 1
+        and causal
+    ):
+        from aiter.ops.triton.attention.mla_decode_balanced import (
+            mla_decode_balanced,
+            use_mla_decode_balanced,
+        )
+
+        if use_mla_decode_balanced(
+            q, kv_buffer, o, qo_indptr, max_seqlen_q, page_size, nhead_kv
+        ):
+            mla_decode_balanced(
+                q,
+                kv_buffer,
+                o,
+                kv_indptr,
+                kv_indices,
+                max_seqlen_q,
+                q.shape[-1] ** -0.5 if sm_scale is None else sm_scale,
+            )
+            return o, None
+
     kv_shuffled_flag = 0
     # ATOM's QH128 dense path must route before accessing any CSR metadata.
     if kv_layout == "kv_shuffled":
