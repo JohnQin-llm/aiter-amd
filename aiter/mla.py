@@ -1069,6 +1069,78 @@ def mla_decode_fwd(
         kv_layout != "kv_shuffled" or q.ndim != 3 or q.shape[1] != 64
     ):
         raise ValueError("token CSR requires kv_shuffled QH64")
+    # BEGIN mla_decode_balanced dispatch
+    # Token-balanced Gluon decode for bf16 16-head MLA (aiter.ops.triton.attention.
+    # mla_decode_balanced; on by default in its scope, AITER_MLA_DECODE_BALANCED=0 turns it off).
+    # Short and long steps run two Gluon configurations chosen on the device by the step's KV tokens
+    # (no host sync, graph-safe). AITER_MLA_BALANCED_LONG=asm keeps long steps on the persistent asm
+    # kernel instead (its main kernel then gets empty work for short steps; one reduce launch).
+    _bal_reduce = None
+    if (
+        q.dtype == dtypes.bf16
+        and q.dim() == 3
+        and q.shape[1] == 16
+        and kv_layout == "token_major"
+        and kv_csr_layout == "page"
+        and logit_cap <= 0
+        and not return_lse
+        and not return_logits
+        and q_scale is None
+        and kv_scale is None
+        and g_kv_indptr is None
+        and cp_world_size == 1
+        and causal
+    ):
+        from aiter.ops.triton.attention import mla_decode_balanced as _bal
+
+        if _bal.use_mla_decode_balanced(
+            q, kv_buffer, o, qo_indptr, max_seqlen_q, page_size, nhead_kv
+        ):
+            _scale = q.shape[-1] ** -0.5 if sm_scale is None else sm_scale
+            _hybrid = (
+                work_meta_data is not None
+                and work_indptr is not None
+                and work_info_set is not None
+                and reduce_indptr is not None
+                and reduce_final_map is not None
+                and reduce_partial_map is not None
+                and (
+                    num_kv_splits is not None
+                    or _use_persistent_mla_decode(
+                        qo_indptr.shape[0] - 1, q.shape[1], max_seqlen_q, q.dtype,
+                        kv_buffer.dtype,
+                    )
+                )
+            )
+            _switch = _bal.DUAL_SWITCH_TOKENS
+            if kv_indices.numel() <= _switch:
+                # kv_indices bounds the step's KV tokens on the host (fixed under graph capture):
+                # only the short-step kernel can be needed
+                _bal.mla_decode_balanced(
+                    q, kv_buffer, o, kv_indptr, kv_indices, max_seqlen_q, _scale
+                )
+                return o, None
+            if not (_bal.long_steps_on_asm() and _hybrid):
+                # both Gluon configurations, chosen on the device by the step's KV tokens
+                _bal.mla_decode_balanced(
+                    q, kv_buffer, o, kv_indptr, kv_indices, max_seqlen_q, _scale,
+                    dual=True, total_max=_switch,
+                )
+                return o, None
+            # AITER_MLA_BALANCED_LONG=asm: long steps on the persistent asm path (device-side hybrid)
+            work_meta_data, _bal_reduce = _bal.mla_decode_balanced(
+                q,
+                kv_buffer,
+                o,
+                kv_indptr,
+                kv_indices,
+                max_seqlen_q,
+                _scale,
+                hybrid=dict(work_meta_data=work_meta_data, work_indptr=work_indptr),
+                total_max=_bal.BALANCED_MAX_TOKENS,
+            )
+    # END mla_decode_balanced dispatch
+
     kv_shuffled_flag = 0
     # ATOM's QH128 dense path must route before accessing any CSR metadata.
     if kv_layout == "kv_shuffled":
@@ -1676,17 +1748,29 @@ def mla_decode_fwd(
                 causal,
             )
 
-        _mla_decode_reduce_v1_dispatch(
-            logits,
-            attn_lse,
-            reduce_indptr,
-            reduce_final_map,
-            reduce_partial_map,
-            max_seqlen_q,
-            num_kv_splits,
-            o,
-            final_lse,
-        )
+        if _bal_reduce is not None:
+            # hybrid balanced dispatch: one reduce launch (balanced merge or asm partials)
+            _bal_reduce(
+                dict(
+                    reduce_indptr=reduce_indptr,
+                    reduce_final_map=reduce_final_map,
+                    reduce_partial_map=reduce_partial_map,
+                    partial_lse=attn_lse,
+                    partial_output=logits.view(-1, nhead, v_head_dim),
+                )
+            )
+        else:
+            _mla_decode_reduce_v1_dispatch(
+                logits,
+                attn_lse,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+                max_seqlen_q,
+                num_kv_splits,
+                o,
+                final_lse,
+            )
 
     if io_transformed:
         if return_logits:
