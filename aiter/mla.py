@@ -1069,7 +1069,7 @@ def mla_decode_fwd(
         kv_layout != "kv_shuffled" or q.ndim != 3 or q.shape[1] != 64
     ):
         raise ValueError("token CSR requires kv_shuffled QH64")
-    # Opt-in token-balanced Triton decode for bf16 16-head MLA (AITER_MLA_DECODE_BALANCED=1); it
+    # Opt-in token-balanced Gluon/Triton decode for bf16 16-head MLA (AITER_MLA_DECODE_BALANCED=1); it
     # ignores the persistent metadata buffers and computes its own split on the device.
     if (
         os.environ.get("AITER_MLA_DECODE_BALANCED", "0") == "1"

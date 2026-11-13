@@ -10,12 +10,16 @@ the device from ``kv_indptr`` on every launch (fixed grid, no metadata kernel, n
 captured HIP graph stays balanced when the lengths change. Heads are not padded: H query heads x
 q_len tokens form one tile, and fp32 partials are written only for sequences split across programs.
 
+Two main kernels share the schedule and the merge: a Gluon one for gfx950 with 16 heads and q_len 1
+(async global->LDS copies, about 5 TB/s on long streams), and a portable Triton one (any head count
+that fits one MFMA tile, q_len >= 1).
+
 ``mla_decode_fwd`` routes here (see ``use_mla_decode_balanced``) only when
-``AITER_MLA_DECODE_BALANCED=1``: on MI355X it is faster than the persistent asm path for batches of
-16-64 sequences with up to ~0.5M KV tokens in total, but slower for long contexts (it streams the
-latent cache at ~2.5-3 TB/s against ~5 TB/s for the asm kernel) and for 1-4 sequences, and the
-dispatch cannot see the KV lengths (frameworks pass padded bounds and whole-pool index buffers
-under graph capture), so it is opt-in.
+``AITER_MLA_DECODE_BALANCED=1``. On MI355X with 1-64 sequences it is 1.3-2x faster than the
+persistent asm path up to ~1M KV tokens and within ~1 % at 64 x 32k. With 2M+ tokens per step
+(e.g. 32-64 x 128k) the asm kernel streams faster (~5.8 against ~4.9 TB/s, 13-17 % slower), and
+the dispatch cannot see the KV lengths (frameworks pass padded bounds and whole-pool index buffers
+under graph capture), so it stays opt-in.
 """
 
 import os
@@ -49,11 +53,17 @@ def mla_decode_balanced(
     kv_indices: torch.Tensor,
     max_seqlen_q: int,
     sm_scale: float,
-    programs_per_cu: float = 2,
+    programs_per_cu: float = 0,
     tile: int = 16,
     num_warps: int = 4,
     num_stages: int = 1,
-    merge_block_p: int = 16,
+    backend: str | None = None,
+    unit: int = 64,
+    g_tile: int = 64,
+    g_warps: int = 4,
+    g_buffers: int = 2,
+    g_waves: int = 1,
+    merge_block_p: int = 32,
     merge_block_d: int = 256,
     merge_num_warps: int = 4,
 ) -> torch.Tensor:
@@ -74,8 +84,18 @@ def mla_decode_balanced(
     assert kv_indptr.numel() >= num_seqs + 1
     kv = kv_buffer.reshape(-1, dqk)
     assert kv.stride(-1) == 1 and q.stride(-1) == 1 and o.stride(-1) == 1
+    if backend is None:
+        from aiter.jit.utils.chip_info import get_gfx
+
+        gluon_ok = get_gfx() == "gfx950" and nhead == 16 and qlen == 1
+        backend = "gluon" if gluon_ok else "triton"
+    if backend == "triton":
+        unit = tile
     rows = qlen * nhead
     block_m = max(16, triton.next_power_of_2(rows))
+    if not programs_per_cu:
+        # the Gluon kernel holds 2 x 64-token LDS tiles (150 KB): one program per CU
+        programs_per_cu = 1 if backend == "gluon" else 2
     num_progs = max(1, int(_num_cus(q.device) * programs_per_cu))
     n = num_progs * 2 * block_m
     part_m = torch.empty(n, dtype=torch.float32, device=q.device)
@@ -84,13 +104,27 @@ def mla_decode_balanced(
     task = torch.empty(num_seqs * 4, dtype=torch.int32, device=q.device)
     block_b = max(16, triton.next_power_of_2(num_seqs))
 
-    _mla_decode_balanced_kernel[(num_progs,)](
-        o, q, kv, kv_indptr, kv_indices, part_m, part_l, part_o, task,
-        num_seqs, num_progs, float(sm_scale),
-        q.stride(0), q.stride(1), o.stride(0), o.stride(1), kv.stride(0),
-        NUM_HEADS=nhead, QLEN=qlen, DV=_DV, DR=_DR, TILE=tile, BLOCK_M=block_m, BLOCK_B=block_b,
-        num_warps=num_warps, num_stages=num_stages,
-    )
+    if backend == "gluon":
+        assert nhead == 16 and qlen == 1, "the Gluon kernel covers 16 heads, q_len 1"
+        from aiter.ops.triton._gluon_kernels.gfx950.attention.mla_decode_balanced import (
+            _mla_decode_balanced_gluon_kernel,
+        )
+
+        _mla_decode_balanced_gluon_kernel[(num_progs,)](
+            o, q, kv, kv_indptr, kv_indices, part_m, part_l, part_o, task,
+            num_seqs, num_progs, float(sm_scale),
+            q.stride(0), q.stride(1), o.stride(0), o.stride(1), kv.stride(0),
+            DV=_DV, DR=_DR, UNIT=unit, TILE=g_tile, BLOCK_B=block_b, NUM_WARPS=g_warps,
+            NUM_BUFFERS=g_buffers, KV_PAD=8, num_warps=g_warps, waves_per_eu=g_waves,
+        )
+    else:
+        _mla_decode_balanced_kernel[(num_progs,)](
+            o, q, kv, kv_indptr, kv_indices, part_m, part_l, part_o, task,
+            num_seqs, num_progs, float(sm_scale),
+            q.stride(0), q.stride(1), o.stride(0), o.stride(1), kv.stride(0),
+            NUM_HEADS=nhead, QLEN=qlen, DV=_DV, DR=_DR, TILE=unit, BLOCK_M=block_m, BLOCK_B=block_b,
+            num_warps=num_warps, num_stages=num_stages,
+        )
     # one program per (sequence, query row, column block): fixed grid for a given batch size
     _mla_decode_balanced_merge_kernel[(num_seqs, rows, _DV // merge_block_d)](
         o, task, kv_indptr, part_m, part_l, part_o, num_progs, o.stride(0), o.stride(1),
@@ -104,8 +138,8 @@ def mla_decode_balanced(
 # Dispatch from mla_decode_fwd, on host-known values only (no device->host sync, graph-safe).
 # ---------------------------------------------------------------------------------------------
 
-BALANCED_MIN_SEQS = 16
-BALANCED_MAX_SEQS = 64
+BALANCED_MIN_SEQS = 1
+BALANCED_MAX_SEQS = 64  # above, the asm kernel is faster (256 x 8k: 1.07x, 256 x 32k: 1.20x)
 
 
 def use_mla_decode_balanced(
@@ -118,9 +152,9 @@ def use_mla_decode_balanced(
     nhead_kv: int,
 ) -> bool:
     """True when ``AITER_MLA_DECODE_BALANCED=1`` and the call is a bf16 gfx950 decode step this kernel
-    covers: 16 query heads, q_len 1 (the kernel also handles q_len 2 / MTP, but is slower than the asm
-    path there), 576-wide latent cache with page size 1,
-    and BALANCED_MIN_SEQS..BALANCED_MAX_SEQS sequences. The caller checks the remaining mla_decode_fwd options
+    covers: 16 query heads, q_len 1 (the Triton kernel also handles q_len 2 / MTP, but is slower than
+    the asm path there), 576-wide latent cache with page size 1, and
+    BALANCED_MIN_SEQS..BALANCED_MAX_SEQS sequences. The caller checks the remaining mla_decode_fwd options
     (no LSE / logits output, no logit cap, no scales, no context parallelism, token-major layout)."""
     if os.environ.get("AITER_MLA_DECODE_BALANCED", "0") != "1":
         return False
