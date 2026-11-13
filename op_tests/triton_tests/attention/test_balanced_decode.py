@@ -99,3 +99,16 @@ def test_balanced_gqa_decode_graph_replay():
         g.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(out.float(), _ref(q, kc, vc, bt, lens, scale), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("lens", [[1024] * 4, [3000, 200] * 16, [1024] * 64])
+def test_gqa_paged_decode_dispatch(lens):
+    """The dispatching wrapper gives the same result on either path (balanced / unified)."""
+    from aiter.ops.triton.attention.balanced_decode import gqa_paged_decode
+
+    num_q_heads, num_kv_heads, ps = 32, 8, 16
+    q, kc, vc, bt, seq_lens, _ = _make(lens, num_q_heads, num_kv_heads, ps)
+    scale = 1.0 / math.sqrt(HEAD)
+    ws = balanced_gqa_decode_workspace(num_q_heads, num_kv_heads, HEAD, "cuda")
+    out = gqa_paged_decode(q, kc, vc, seq_lens, bt, max(lens), softmax_scale=scale, workspace=ws)
+    torch.testing.assert_close(out.float(), _ref(q, kc, vc, bt, lens, scale), atol=2e-2, rtol=2e-2)

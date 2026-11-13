@@ -192,10 +192,15 @@ def _balanced_gqa_decode_merge_kernel(
     MIN_TILES: tl.constexpr,
     BLOCK_P: tl.constexpr,  # partials merged per step
 ):
-    """One program per (sequence, query head): merge the partials of a split sequence by
-    log-sum-exp. Recomputes the same on-device schedule as the main kernel; sequences that
-    one program covered (written by the main kernel) exit at once."""
-    seq = tl.program_id(0)
+    """Merge the partials of the split sequences by log-sum-exp.
+
+    A sequence is split only where a program boundary falls inside it, so the grid is one
+    program per (program boundary j = 1 .. P-1, query head), independent of the batch size and
+    lengths. Program j recomputes the schedule, finds the sequence holding boundary j and merges
+    it only if j is the first boundary inside that sequence; every other program (boundary at a
+    sequence start, later boundary of the same sequence, unused program) exits at once.
+    Sequences covered by one program were written by the main kernel and are not touched."""
+    j = tl.program_id(0) + 1
     head = tl.program_id(1)
     grp = head // ROWS
     row = head % ROWS
@@ -203,16 +208,19 @@ def _balanced_gqa_decode_merge_kernel(
     offs_b, lens, tiles, cum, total, nprog = _schedule(
         seq_lens_ptr, num_seqs, num_progs, TILE, BLOCK_B, MIN_TILES
     )
-    c_end = _pick(cum, offs_b, seq).to(tl.int64)
-    n_tiles = _pick(tiles, offs_b, seq)
-    c_start = c_end - n_tiles
-    if n_tiles == 0:
+    if j >= nprog:
         return
+    u = (j * total) // nprog  # first tile of program j
+    seq = tl.sum((cum <= u).to(tl.int32), axis=0)
+    c_end = _pick(cum, offs_b, seq).to(tl.int64)
+    c_start = c_end - _pick(tiles, offs_b, seq)
+    if u == c_start:
+        return  # boundary at a sequence start: nothing split here
     # programs covering tiles [c_start, c_end): tile u belongs to program ((u + 1) * P - 1) // T
     p_first = ((c_start + 1) * nprog - 1) // total
+    if j != p_first + 1:
+        return  # merged by the first boundary inside this sequence
     p_last = (c_end * nprog - 1) // total
-    if p_first == p_last:
-        return
     first_slot = ((p_first * total) // nprog < c_start).to(tl.int64)
 
     offs_p = tl.arange(0, BLOCK_P)

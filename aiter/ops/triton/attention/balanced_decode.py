@@ -95,6 +95,7 @@ def balanced_gqa_decode(
     num_warps: int = 4,
     num_stages: int = 3,
     merge_block_p: int = 0,
+    merge_num_warps: int = 1,
 ) -> torch.Tensor:
     """
     q:          [num_seqs, num_q_heads, head_size], one decode token per sequence.
@@ -176,11 +177,13 @@ def balanced_gqa_decode(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-    # partials per split sequence ~ programs per sequence + 2: one merge step covers them
+    # partials per split sequence: ~ programs per sequence + 2 for even lengths, more for the long
+    # sequences of a skewed batch; a wide step is cheap (masked loads), extra steps cost latency
     if not merge_block_p:
         per_seq = triton.cdiv(workspace.num_progs, num_seqs) + 2
-        merge_block_p = min(128, max(4, triton.next_power_of_2(per_seq)))
-    _balanced_gqa_decode_merge_kernel[(num_seqs, num_q_heads)](
+        merge_block_p = min(64, max(8, triton.next_power_of_2(per_seq)))
+    # one program per (program boundary, query head): fixed grid, captured once in a graph
+    _balanced_gqa_decode_merge_kernel[(max(1, workspace.num_progs - 1), num_q_heads)](
         out,
         seq_lens,
         workspace.part_m,
@@ -198,6 +201,79 @@ def balanced_gqa_decode(
         BLOCK_B=block_b,
         MIN_TILES=min_tiles,
         BLOCK_P=merge_block_p,
-        num_warps=4,
+        num_warps=merge_num_warps,
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------------------------
+# Dispatch between balanced_gqa_decode and unified_attention on graph-safe host quantities.
+# ---------------------------------------------------------------------------------------------
+
+BALANCED_MIN_SEQS = 16
+BALANCED_MAX_SEQS = 128
+BALANCED_MIN_MAX_SEQLEN = 2048
+BALANCED_MAX_WORK = 1 << 20  # num_seqs * max_seqlen_k
+
+
+def use_balanced_decode(num_seqs: int, num_kv_heads: int, page_size: int, max_seqlen_k: int) -> bool:
+    """Pick balanced_gqa_decode over unified_attention from host-known values only (no
+    device->host sync, so the choice is fixed per captured graph and valid for any lengths).
+
+    Rule (MI355X, bf16, head size 128, GQA 4 and 8, page 16 and 1):
+      * 16 <= num_seqs <= 128: with fewer sequences unified_attention's per-sequence split
+        already fills the GPU and the balanced op's second (merge) launch dominates; with more,
+        unified_attention has enough programs to hide skew.
+      * max_seqlen_k >= 2048: below that every sequence is at most a few tiles, the batch is
+        latency-bound and unified_attention's single launch wins even when lengths differ.
+      * num_seqs * max_seqlen_k <= 2**20: above that bound unified_attention streams near the
+        bandwidth ceiling and the balanced kernel's loop is up to ~6 % slower.
+    Inside that range the balanced op is within a few percent of unified_attention on uniform
+    lengths and up to ~2x faster when lengths are skewed. num_kv_heads and page_size are part
+    of the signature for future tuning; the measured GQA ratios (4, 8) and page sizes (1, 16)
+    share the rule.
+    """
+    return (
+        BALANCED_MIN_SEQS <= num_seqs <= BALANCED_MAX_SEQS
+        and max_seqlen_k >= BALANCED_MIN_MAX_SEQLEN
+        and num_seqs * max_seqlen_k <= BALANCED_MAX_WORK
+    )
+
+
+def gqa_paged_decode(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    max_seqlen_k: int,
+    softmax_scale: Optional[float] = None,
+    out: Optional[torch.Tensor] = None,
+    workspace: Optional[BalancedDecodeWorkspace] = None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Decode step (q_len 1) through balanced_gqa_decode or unified_attention, chosen by
+    use_balanced_decode() on host values. max_seqlen_k is the host bound the caller already
+    passes to unified_attention (it may be an upper bound, e.g. under graph capture).
+    cu_seqlens_q ([num_seqs + 1], arange) is the caller's query_start_loc; created here when
+    None (one extra small kernel)."""
+    num_seqs, num_q_heads, head_size = q.shape
+    num_kv_heads, page_size = k_cache.shape[2], k_cache.shape[1]
+    if softmax_scale is None:
+        softmax_scale = head_size**-0.5
+    if out is None:
+        out = torch.empty_like(q)
+    if use_balanced_decode(num_seqs, num_kv_heads, page_size, max_seqlen_k):
+        return balanced_gqa_decode(
+            q, k_cache, v_cache, seq_lens, block_table=block_table,
+            softmax_scale=softmax_scale, out=out, workspace=workspace,
+        )
+    from aiter.ops.triton.attention.unified_attention import unified_attention
+
+    if cu_seqlens_q is None:
+        cu_seqlens_q = torch.arange(num_seqs + 1, device=q.device, dtype=torch.int32)
+    unified_attention(
+        q, k_cache, v_cache, out, cu_seqlens_q, 1, seq_lens, max_seqlen_k, softmax_scale, True,
+        (-1, -1), block_table, 0, None, None, None,
     )
     return out
